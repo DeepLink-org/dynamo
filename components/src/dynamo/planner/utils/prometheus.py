@@ -51,6 +51,8 @@ class PrometheusAPIClient:
     Supports querying both frontend and backend metrics:
     - Frontend metrics: dynamo_frontend_* (from Dynamo HTTP frontend)
     - Backend metrics: vllm:* (from vLLM engine workers)
+    - Backend metrics: sglang:* (from SGLang engine workers)
+    - Backend metrics: trtllm:* (from TensorRT-LLM engine workers)
 
     Usage:
         # Query frontend metrics (default)
@@ -58,16 +60,31 @@ class PrometheusAPIClient:
                                              dynamo_namespace="my-deployment")
         ttft = frontend_client.get_avg_time_to_first_token("60s", "llama-3-8b")
 
-        # Query backend worker metrics
+        # Query backend worker metrics (vLLM)
         backend_client = PrometheusAPIClient(url="http://prometheus:9090",
                                             dynamo_namespace="my-deployment",
-                                            metric_source="backend")
+                                            metric_source="backend",
+                                            backend_type="vllm")
+        ttft = backend_client.get_avg_time_to_first_token("60s", "llama-3-8b")
+
+        # Query backend worker metrics (SGLang)
+        backend_client = PrometheusAPIClient(url="http://prometheus:9090",
+                                            dynamo_namespace="my-deployment",
+                                            metric_source="backend",
+                                            backend_type="sglang")
+        ttft = backend_client.get_avg_time_to_first_token("60s", "llama-3-8b")
+
+        # Query backend worker metrics (TensorRT-LLM)
+        backend_client = PrometheusAPIClient(url="http://prometheus:9090",
+                                            dynamo_namespace="my-deployment",
+                                            metric_source="backend",
+                                            backend_type="trtllm")
         ttft = backend_client.get_avg_time_to_first_token("60s", "llama-3-8b")
     """
 
     # Metric name mapping for backend (vLLM) metrics
     # Maps from frontend metric concept to actual vLLM metric name
-    BACKEND_METRIC_MAP = {
+    VLLM_BACKEND_METRIC_MAP = {
         "time_to_first_token_seconds": "time_to_first_token_seconds",  # histogram
         "inter_token_latency_seconds": "inter_token_latency_seconds",  # histogram
         "request_duration_seconds": "e2e_request_latency_seconds",  # histogram - vLLM's e2e latency
@@ -76,8 +93,37 @@ class PrometheusAPIClient:
         "requests_total": "request_success_total",  # counter
     }
 
+    # Metric name mapping for backend (SGLang) metrics
+    # Maps from frontend metric concept to actual SGLang metric name
+    SGLANG_BACKEND_METRIC_MAP = {
+        "time_to_first_token_seconds": "time_to_first_token_seconds",  # histogram
+        "inter_token_latency_seconds": "inter_token_latency_seconds",  # histogram
+        "request_duration_seconds": "e2e_request_latency_seconds",  # histogram - SGLang's e2e latency
+        "input_sequence_tokens": "prompt_tokens_total",  # counter - total prompt tokens
+        "output_sequence_tokens": "generation_tokens_total",  # counter - total generation tokens
+        "requests_total": "request_success_total",  # counter
+    }
+
+    # Metric name mapping for backend (TensorRT-LLM) metrics
+    # Maps from frontend metric concept to actual TensorRT-LLM metric name
+    TRTLLM_BACKEND_METRIC_MAP = {
+        "time_to_first_token_seconds": "time_to_first_token_seconds",  # histogram
+        "inter_token_latency_seconds": "time_per_output_token_seconds",  # histogram - TRT-LLM uses time_per_output_token
+        "request_duration_seconds": "e2e_request_latency_seconds",  # histogram - TRT-LLM's e2e latency
+        "input_sequence_tokens": "prompt_tokens_total",  # counter - total prompt tokens (may need component metrics)
+        "output_sequence_tokens": "generation_tokens_total",  # counter - total generation tokens (may need component metrics)
+        "requests_total": "request_success_total",  # counter
+    }
+
+    # Keep BACKEND_METRIC_MAP for backwards compatibility (defaults to vLLM)
+    BACKEND_METRIC_MAP = VLLM_BACKEND_METRIC_MAP
+
     def __init__(
-        self, url: str, dynamo_namespace: str, metric_source: str = "frontend"
+        self,
+        url: str,
+        dynamo_namespace: str,
+        metric_source: str = "frontend",
+        backend_type: str = "vllm",
     ):
         """
         Initialize Prometheus API client.
@@ -87,16 +133,39 @@ class PrometheusAPIClient:
             dynamo_namespace: Dynamo namespace to filter metrics
             metric_source: Either "frontend" or "backend".
                           "frontend" queries dynamo_frontend_* metrics
-                          "backend" queries vllm:* metrics from workers
+                          "backend" queries backend-specific metrics (vllm:*, sglang:*, or trtllm:*)
+            backend_type: Backend type for metric queries. Either "vllm", "sglang", or "trtllm".
+                         Only used when metric_source="backend". Defaults to "vllm".
         """
         if metric_source not in ["frontend", "backend"]:
             raise ValueError(
                 f"metric_source must be 'frontend' or 'backend', got: {metric_source}"
             )
 
+        if backend_type.lower() not in ["vllm", "sglang", "trtllm"]:
+            raise ValueError(
+                f"backend_type must be 'vllm', 'sglang', or 'trtllm', got: {backend_type}"
+            )
+
         self.prom = PrometheusConnect(url=url, disable_ssl=True)
         self.dynamo_namespace = dynamo_namespace
         self.metric_source = metric_source
+        self.backend_type = backend_type.lower()
+
+        # Set the appropriate metric map and prefix based on backend type
+        if self.metric_source == "backend":
+            if self.backend_type == "sglang":
+                self.backend_metric_map = self.SGLANG_BACKEND_METRIC_MAP
+                self.backend_prefix = "sglang:"
+            elif self.backend_type == "trtllm":
+                self.backend_metric_map = self.TRTLLM_BACKEND_METRIC_MAP
+                self.backend_prefix = "trtllm:"
+            else:  # vllm
+                self.backend_metric_map = self.VLLM_BACKEND_METRIC_MAP
+                self.backend_prefix = "vllm:"
+        else:
+            self.backend_metric_map = None
+            self.backend_prefix = None
 
     def _get_average_metric(
         self, full_metric_name: str, interval: str, operation_name: str, model_name: str
@@ -125,10 +194,10 @@ class PrometheusAPIClient:
                         f"{prometheus_names.name_prefix.FRONTEND}_{full_metric_name}"
                     )
             else:  # backend
-                # Backend uses vllm: prefix
-                # Check if it's already a full vllm metric name (from our mapping)
-                if not full_metric_name.startswith("vllm:"):
-                    full_metric_name = f"vllm:{full_metric_name}"
+                # Backend uses backend-specific prefix (vllm: or sglang:)
+                # Check if it's already a full backend metric name (from our mapping)
+                if not full_metric_name.startswith(self.backend_prefix):
+                    full_metric_name = f"{self.backend_prefix}{full_metric_name}"
 
             query = f"increase({full_metric_name}_sum[{interval}])/increase({full_metric_name}_count[{interval}])"
             result = self.prom.custom_query(query=query)
@@ -186,13 +255,13 @@ class PrometheusAPIClient:
     ) -> float:
         """
         Get average value from a counter metric by dividing total increase by request count increase.
-        Used for vLLM token counters (prompt_tokens_total, generation_tokens_total).
+        Used for backend token counters (prompt_tokens_total, generation_tokens_total).
 
         Formula: increase(counter_total[interval]) / increase(request_success_total[interval])
         """
         try:
-            full_metric_name = f"vllm:{counter_metric}"
-            requests_metric = "vllm:request_success_total"
+            full_metric_name = f"{self.backend_prefix}{counter_metric}"
+            requests_metric = f"{self.backend_prefix}request_success_total"
 
             # Query both the counter and request count
             counter_query = f"increase({full_metric_name}[{interval}])"
@@ -264,7 +333,7 @@ class PrometheusAPIClient:
     def get_avg_request_duration(self, interval: str, model_name: str):
         if self.metric_source == "backend":
             # Backend uses e2e_request_latency_seconds instead of request_duration_seconds
-            metric_name = self.BACKEND_METRIC_MAP["request_duration_seconds"]
+            metric_name = self.backend_metric_map["request_duration_seconds"]
             return self._get_average_metric(
                 metric_name,
                 interval,
@@ -283,7 +352,7 @@ class PrometheusAPIClient:
         Get request count over the specified interval.
 
         For frontend: queries dynamo_frontend_requests_total
-        For backend: queries vllm:request_success_total
+        For backend: queries backend-specific request_success_total (vllm: or sglang:)
         """
         try:
             if self.metric_source == "frontend":
@@ -294,8 +363,8 @@ class PrometheusAPIClient:
                 ):
                     requests_total_metric = f"{prometheus_names.name_prefix.FRONTEND}_{requests_total_metric}"
             else:  # backend
-                # Backend uses vllm:request_success_total
-                requests_total_metric = "vllm:request_success_total"
+                # Backend uses backend-specific request_success_total
+                requests_total_metric = f"{self.backend_prefix}request_success_total"
 
             raw_res = self.prom.custom_query(
                 query=f"increase({requests_total_metric}[{interval}])"
@@ -338,7 +407,7 @@ class PrometheusAPIClient:
     def get_avg_input_sequence_tokens(self, interval: str, model_name: str):
         if self.metric_source == "backend":
             # Backend uses prompt_tokens counter (not histogram)
-            metric_name = self.BACKEND_METRIC_MAP["input_sequence_tokens"]
+            metric_name = self.backend_metric_map["input_sequence_tokens"]
             return self._get_counter_average(
                 metric_name, interval, model_name, "input_sequence_tokens"
             )
@@ -352,7 +421,7 @@ class PrometheusAPIClient:
     def get_avg_output_sequence_tokens(self, interval: str, model_name: str):
         if self.metric_source == "backend":
             # Backend uses generation_tokens counter (not histogram)
-            metric_name = self.BACKEND_METRIC_MAP["output_sequence_tokens"]
+            metric_name = self.backend_metric_map["output_sequence_tokens"]
             return self._get_counter_average(
                 metric_name, interval, model_name, "output_sequence_tokens"
             )
